@@ -1,0 +1,8 @@
+node_modules/
+.DS_Store
+data/models/*.bin
+public/audio/sess-*.wav
+glaido-open.db
+glaido-open.db-shm
+glaido-open.db-wal
+*.log
