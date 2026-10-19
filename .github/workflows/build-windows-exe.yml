@@ -1,0 +1,45 @@
+name: Build Windows .exe Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build Windows Installer & Portable .exe
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: npm run dist:win
+
+      - name: Publish .exe Release Assets to GitHub Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $exeFiles = Get-ChildItem -Path "dist\*.exe" | Select-Object -ExpandProperty FullName
+          Write-Host "Built .exe files:"
+          $exeFiles | ForEach-Object { Write-Host " - $_" }
+          gh release view v0.4.3 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload v0.4.3 $exeFiles --clobber
+          } else {
+            gh release create v0.4.3 $exeFiles --title "Glaido Pro v0.4.3 — Windows .exe Installer & Portable" --notes "Download **Glaido-Pro-Setup-0.4.3.exe** (Standard Windows Installer with Desktop & Start Menu shortcuts) or **Glaido-Pro-Portable-0.4.3.exe** (Single-click standalone portable executable). Press **Alt+Space** in any Windows app to dictate and auto-paste."
+          }

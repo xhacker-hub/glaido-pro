@@ -11,8 +11,12 @@ import { fileURLToPath } from "node:url";
 const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, "public");
-const AUDIO_DIR = path.join(PUBLIC_DIR, "audio");
-const DB_PATH = path.join(__dirname, "glaido-open.db");
+const WRITABLE_DIR = process.env.GLAIDO_DATA_DIR || __dirname;
+fs.mkdirSync(WRITABLE_DIR, { recursive: true });
+const AUDIO_DIR = process.env.GLAIDO_DATA_DIR
+  ? path.join(WRITABLE_DIR, "audio")
+  : path.join(PUBLIC_DIR, "audio");
+const DB_PATH = path.join(WRITABLE_DIR, "glaido-open.db");
 const PORT = Number(process.env.PORT || 4321);
 
 fs.mkdirSync(AUDIO_DIR, { recursive: true });
@@ -1313,10 +1317,16 @@ let activeFfmpegProc = null;
 let nativeAmpTimer = null;
 let livePcmChunks = [];
 let livePcmByteLength = 0;
+let webAudioPcmChunks = [];
+let webAudioPcmByteLength = 0;
+let lastWebAmpBroadcastAt = 0;
 let lastRecordedPcmBuffer = null;
 let windowsDshowMicName = null;
 
 function resolveFfmpegBin() {
+  if (process.env.FFMPEG_BIN && fs.existsSync(process.env.FFMPEG_BIN)) {
+    return process.env.FFMPEG_BIN;
+  }
   if (process.platform === "darwin" && fs.existsSync("/opt/homebrew/bin/ffmpeg")) {
     return "/opt/homebrew/bin/ffmpeg";
   }
@@ -1801,6 +1811,8 @@ function startNativeMicRecording() {
   stopNativeMicRecordingOnly();
   livePcmChunks = [];
   livePcmByteLength = 0;
+  webAudioPcmChunks = [];
+  webAudioPcmByteLength = 0;
   lastRecordedPcmBuffer = null;
   smoothedLiveAmp = 0;
 
@@ -1901,8 +1913,13 @@ async function stopAndTranscribeNativeMic() {
     } catch (_) {}
   }
 
-  if (livePcmByteLength < 2400) return "";
-  const fullPcm = Buffer.concat(livePcmChunks, livePcmByteLength);
+  const useWebAudio = webAudioPcmByteLength > livePcmByteLength;
+  const totalBytes = useWebAudio ? webAudioPcmByteLength : livePcmByteLength;
+  if (totalBytes < 2400) return "";
+
+  const fullPcm = useWebAudio
+    ? Buffer.concat(webAudioPcmChunks, webAudioPcmByteLength)
+    : Buffer.concat(livePcmChunks, livePcmByteLength);
   lastRecordedPcmBuffer = fullPcm;
 
   // 1. Primary: Always-warm Apple M4 Pro Metal4 GPU Whisper engine (100% local, ~260ms, conditioned on Personal Dictionary)
@@ -2140,8 +2157,13 @@ async function handleInvoke(cmd, args = {}) {
 
     case "get_audio_data": {
       const rel = (args.audioPath || "").replace(/^\/+/, "");
-      const full = path.join(PUBLIC_DIR, rel);
-      const buf = fs.existsSync(full) ? fs.readFileSync(full) : generateWavBuffer(2.5, 210);
+      const writableAudio = path.join(AUDIO_DIR, path.basename(rel));
+      const publicAudio = path.join(PUBLIC_DIR, rel);
+      const buf = fs.existsSync(writableAudio)
+        ? fs.readFileSync(writableAudio)
+        : fs.existsSync(publicAudio)
+        ? fs.readFileSync(publicAudio)
+        : generateWavBuffer(2.5, 210);
       return buf.toString("base64");
     }
 
@@ -2599,6 +2621,41 @@ async function handleInvoke(cmd, args = {}) {
       currentLiveTranscript = (args.text || "").trim();
       return { ok: true };
 
+    case "push_pcm_chunk": {
+      if (args.pcmBase64 && overlayVisualState.phase === "recording") {
+        const chunk = Buffer.from(args.pcmBase64, "base64");
+        if (chunk.length >= 2) {
+          webAudioPcmChunks.push(chunk);
+          webAudioPcmByteLength += chunk.length;
+
+          // Compute live amplitude when ffmpeg hasn't already broadcast
+          if (livePcmByteLength === 0) {
+            const sampleCount = chunk.length >> 1;
+            let sumSq = 0;
+            let peak = 0;
+            for (let i = 0; i < sampleCount; i++) {
+              const s = Math.abs(chunk.readInt16LE(i << 1)) / 32768;
+              if (s > peak) peak = s;
+              sumSq += s * s;
+            }
+            const rms = Math.sqrt(sumSq / sampleCount);
+            const now = Date.now();
+            const gatedRms = Math.max(0, rms - 0.005);
+            const gatedPeak = Math.max(0, peak - 0.012);
+            const energy = gatedRms * 0.7 + gatedPeak * 0.3;
+            const rawAmp =
+              energy <= 0.0004 ? 0 : Math.min(68, Math.round(Math.pow(Math.min(1, energy * 28), 0.58) * 68));
+            if (now - lastWebAmpBroadcastAt >= 45 && rawAmp !== smoothedLiveAmp) {
+              lastWebAmpBroadcastAt = now;
+              smoothedLiveAmp = rawAmp;
+              broadcastEvent("amplitude-update", rawAmp);
+            }
+          }
+        }
+      }
+      return { ok: true };
+    }
+
     case "get_live_transcript_state":
       return { liveTranscript: currentLiveTranscript };
 
@@ -2821,6 +2878,9 @@ const server = http.createServer(async (req, res) => {
   if (safePath === "/" || safePath === "") safePath = "/index.html";
 
   let filePath = path.join(PUBLIC_DIR, safePath);
+  if ((safePath.startsWith("/audio/") || safePath.startsWith("\\audio\\")) && fs.existsSync(path.join(AUDIO_DIR, path.basename(safePath)))) {
+    filePath = path.join(AUDIO_DIR, path.basename(safePath));
+  }
   if (!fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
     // React Router SPA route fallback
     filePath = path.join(PUBLIC_DIR, "index.html");
