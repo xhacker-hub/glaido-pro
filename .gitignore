@@ -5,4 +5,8 @@ public/audio/sess-*.wav
 glaido-open.db
 glaido-open.db-shm
 glaido-open.db-wal
+glaido-windows.db*
 *.log
+dist/
+e2e-artifacts/
+

@@ -30,23 +30,59 @@ jobs:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: npm run dist:win
 
-      - name: Smoke-Test Built Windows Executable on Windows Runner
+      - name: Comprehensive E2E Verification of Windows Executables
         shell: pwsh
         run: |
+          # 1. Full E2E Test on Unpacked Native Windows Executable
           $unpackedExe = "dist\win-unpacked\Glaido Pro.exe"
           if (-not (Test-Path $unpackedExe)) {
             Write-Error "Unpacked Windows executable not found at $unpackedExe"
             exit 1
           }
-          Write-Host "Running live Windows smoke test on $unpackedExe..."
-          $proc = Start-Process -FilePath $unpackedExe -ArgumentList "--smoke-test" -PassThru -Wait -NoNewWindow
-          if ($proc.ExitCode -ne 0) {
+          Write-Host "================================================================="
+          Write-Host "Running live Windows E2E Verification on Unpacked Executable..."
+          Write-Host "Target: $unpackedExe"
+          Write-Host "================================================================="
+          $env:GLAIDO_E2E_TEST = "1"
+          $env:GLAIDO_E2E_ARTIFACTS_DIR = Join-Path $PWD "e2e-artifacts\windows-unpacked"
+          $procUnpacked = Start-Process -FilePath $unpackedExe -ArgumentList "--e2e-test" -PassThru -Wait -NoNewWindow
+          if ($procUnpacked.ExitCode -ne 0) {
             $logPath = Join-Path $env:APPDATA "Glaido Pro\glaido-startup.log"
-            if (Test-Path $logPath) { Get-Content $logPath }
-            Write-Error "Windows smoke test exited with code $($proc.ExitCode)"
+            if (Test-Path $logPath) {
+              Write-Host "--- Application Startup Log ---"
+              Get-Content $logPath
+            }
+            Write-Error "Windows unpacked .exe E2E verification failed with exit code $($procUnpacked.ExitCode)"
             exit 1
           }
-          Write-Host "Windows .exe smoke test PASSED!"
+          Write-Host "Unpacked Windows executable E2E verification PASSED!"
+
+          # 2. E2E Verification of Packaged Portable Windows Executable
+          $portableExe = Get-ChildItem -Path "dist\Glaido-Pro-Windows-Portable-*.exe" | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $portableExe -or -not (Test-Path $portableExe)) {
+            Write-Error "Packaged Portable Windows executable not found in dist/"
+            exit 1
+          }
+          Write-Host "================================================================="
+          Write-Host "Running live Windows E2E Verification on Portable Executable..."
+          Write-Host "Target: $portableExe"
+          Write-Host "================================================================="
+          $env:GLAIDO_E2E_TEST = "1"
+          $env:GLAIDO_E2E_ARTIFACTS_DIR = Join-Path $PWD "e2e-artifacts\windows-portable"
+          $procPortable = Start-Process -FilePath $portableExe -ArgumentList "--e2e-test" -PassThru -Wait -NoNewWindow
+          if ($procPortable.ExitCode -ne 0) {
+            Write-Error "Windows portable .exe E2E verification failed with exit code $($procPortable.ExitCode)"
+            exit 1
+          }
+          Write-Host "Portable Windows executable E2E verification PASSED!"
+
+      - name: Upload Windows E2E Screenshots & Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-e2e-artifacts
+          path: e2e-artifacts/
+          if-no-files-found: warn
 
       - name: Publish Pure Windows .exe Assets to GitHub Releases
         env:
@@ -83,9 +119,27 @@ jobs:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: npm run dist:mac
 
-      - name: Smoke-Test Built macOS App Bundle
+      - name: Comprehensive E2E Verification of macOS App Bundle
         run: |
-          "./dist/mac-arm64/Glaido Pro.app/Contents/MacOS/Glaido Pro" --smoke-test
+          APP_EXE="./dist/mac-arm64/Glaido Pro.app/Contents/MacOS/Glaido Pro"
+          if [ ! -f "$APP_EXE" ]; then
+            echo "::error::macOS App Bundle executable not found at $APP_EXE"
+            exit 1
+          fi
+          echo "================================================================="
+          echo "Running live macOS E2E Verification on App Bundle..."
+          echo "Target: $APP_EXE"
+          echo "================================================================="
+          export GLAIDO_E2E_ARTIFACTS_DIR="$PWD/e2e-artifacts/macos"
+          "$APP_EXE" --e2e-test
+
+      - name: Upload macOS E2E Screenshots & Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-e2e-artifacts
+          path: e2e-artifacts/
+          if-no-files-found: warn
 
       - name: Publish Pure macOS Assets to GitHub Releases
         env:

@@ -6,7 +6,9 @@ import crypto from "node:crypto";
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
 
+const require = createRequire(import.meta.url);
 const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const IS_WINDOWS = process.platform === "win32" || process.env.GLAIDO_TARGET_OS === "windows";
@@ -21,21 +23,45 @@ const PORT = Number(process.env.PORT || 4321);
 
 fs.mkdirSync(AUDIO_DIR, { recursive: true });
 
+function resolveSqlWasmPath(file = "sql-wasm.wasm") {
+  const candidates = [];
+  try {
+    const sqlJsMain = require.resolve("sql.js");
+    candidates.push(path.join(path.dirname(sqlJsMain), file));
+  } catch (_) {}
+  candidates.push(path.join(__dirname, "node_modules", "sql.js", "dist", file));
+  if (process.resourcesPath) {
+    candidates.push(path.join(process.resourcesPath, "app", "node_modules", "sql.js", "dist", file));
+    candidates.push(path.join(process.resourcesPath, "app.asar.unpacked", "node_modules", "sql.js", "dist", file));
+  }
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return candidates[0] || path.join(__dirname, "node_modules", "sql.js", "dist", file);
+}
+
 async function openGlaidoDatabase(dbPath) {
   try {
     const sqliteMod = await import("node:sqlite");
     if (sqliteMod && sqliteMod.DatabaseSync) {
-      return new sqliteMod.DatabaseSync(dbPath);
+      try {
+        return new sqliteMod.DatabaseSync(dbPath);
+      } catch (_) {
+        try {
+          if (fs.existsSync(dbPath)) {
+            fs.renameSync(dbPath, `${dbPath}.corrupt-${Date.now()}`);
+          }
+        } catch (_) {}
+        return new sqliteMod.DatabaseSync(dbPath);
+      }
     }
   } catch (_) {}
 
   // Fallback for Electron on Windows where node:sqlite is not compiled into electron.exe:
   // Use sql.js (real SQLite3 compiled to WebAssembly) with synchronous DatabaseSync-compatible API
   const initSqlJs = (await import("sql.js")).default;
-  const wasmCandidate = path.join(__dirname, "node_modules", "sql.js", "dist", "sql-wasm.wasm");
   const SQL = await initSqlJs({
-    locateFile: (file) =>
-      fs.existsSync(wasmCandidate) ? wasmCandidate : path.join(__dirname, "node_modules", "sql.js", "dist", file)
+    locateFile: (file) => resolveSqlWasmPath(file)
   });
 
   let rawDb = null;
@@ -2166,8 +2192,27 @@ async function handleInvoke(cmd, args = {}) {
     }
 
     // --- Permissions, Microphones & Hotkeys ---
-    case "check_permissions":
-    case "request_microphone_permission":
+    case "check_permissions": {
+      let micGranted = true;
+      if (typeof globalThis.__glaidoGetMicrophonePermissionStatus === "function") {
+        try {
+          const status = globalThis.__glaidoGetMicrophonePermissionStatus();
+          micGranted = status === "granted";
+        } catch (_) {}
+      }
+      return { microphone: micGranted, accessibility: true };
+    }
+
+    case "request_microphone_permission": {
+      let micGranted = true;
+      if (typeof globalThis.__glaidoRequestMicrophonePermission === "function") {
+        try {
+          micGranted = Boolean(await globalThis.__glaidoRequestMicrophonePermission());
+        } catch (_) {}
+      }
+      return { microphone: micGranted, accessibility: true };
+    }
+
     case "request_accessibility_permission":
       return { microphone: true, accessibility: true };
 
@@ -3080,6 +3125,17 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => {
-  console.log(`Glaido Open Pro Replica running at http://localhost:${PORT}`);
+const listenPort = Number(process.env.PORT || PORT || 4321);
+server.on("error", (err) => {
+  console.error("[SERVER_ERROR]", err?.message || err);
 });
+if (IS_WINDOWS) {
+  server.listen(listenPort, "127.0.0.1", () => {
+    console.log(`Glaido Open Pro Replica running at http://127.0.0.1:${listenPort}`);
+  });
+} else {
+  server.listen(listenPort, () => {
+    console.log(`Glaido Open Pro Replica running at http://localhost:${listenPort}`);
+  });
+}
+

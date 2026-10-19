@@ -8,17 +8,20 @@ const {
   nativeImage,
   session,
   shell,
-  clipboard
+  clipboard,
+  systemPreferences
 } = require("electron");
 const path = require("node:path");
 const fs = require("node:fs");
 const http = require("node:http");
-const { spawn, execFile } = require("node:child_process");
+const net = require("node:net");
+const { spawn, execFile, execFileSync } = require("node:child_process");
 const { pathToFileURL } = require("node:url");
 
-const PORT = Number(process.env.PORT || 4321);
-const BASE_URL = `http://127.0.0.1:${PORT}`;
+let PORT = Number(process.env.PORT || 4321);
+let BASE_URL = `http://127.0.0.1:${PORT}`;
 const IS_SMOKE_TEST = process.argv.includes("--smoke-test") || process.env.GLAIDO_SMOKE_TEST === "1";
+const IS_E2E_TEST = process.argv.includes("--e2e-test") || process.env.GLAIDO_E2E_TEST === "1";
 
 let mainWindow = null;
 let overlayWindow = null;
@@ -27,24 +30,9 @@ let isQuitting = false;
 let isRecording = false;
 let isProcessing = false;
 let winPasteWorker = null;
+let hasShownTrayBalloon = false;
 
-// Ensure single instance (skip during CI smoke test)
-if (!IS_SMOKE_TEST) {
-  const gotLock = app.requestSingleInstanceLock();
-  if (!gotLock) {
-    app.quit();
-  } else {
-    app.on("second-instance", () => {
-      if (mainWindow) {
-        if (mainWindow.isMinimized()) mainWindow.restore();
-        mainWindow.show();
-        mainWindow.focus();
-      }
-    });
-  }
-}
-
-// Configure writable data directory & bundled ffmpeg before importing server.mjs
+// Configure writable data directory & startup logger
 const userDataDir = app.getPath("userData");
 fs.mkdirSync(userDataDir, { recursive: true });
 process.env.GLAIDO_DATA_DIR = userDataDir;
@@ -55,6 +43,64 @@ function logStartup(msg) {
   try {
     fs.appendFileSync(logFilePath, `[${new Date().toISOString()}] ${msg}\n`);
   } catch (_) {}
+}
+
+// Terminate any orphaned/zombie Glaido Pro.exe processes from earlier runs on Windows
+// so SingleInstanceLock and port 4321 are never deadlocked
+function killOrphanedWindowsInstancesSync() {
+  if (process.platform !== "win32" || IS_SMOKE_TEST || IS_E2E_TEST) return;
+  try {
+    const currentPid = process.pid;
+    const psCmd = `Get-CimInstance Win32_Process | Where-Object { $_.Name -like 'Glaido*' -and $_.ProcessId -ne ${currentPid} -and $_.ProcessId -ne $PID } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`;
+    execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", psCmd], {
+      timeout: 3000,
+      windowsHide: true,
+      stdio: "ignore"
+    });
+  } catch (_) {}
+}
+
+killOrphanedWindowsInstancesSync();
+
+function findAvailablePort(startPort, maxAttempts = 20) {
+  return new Promise((resolve) => {
+    const testNext = (port, attemptsLeft) => {
+      if (attemptsLeft <= 0) return resolve(startPort);
+      const tester = net.createServer();
+      tester.unref();
+      tester.on("error", (err) => {
+        if (err.code === "EADDRINUSE" || err.code === "EACCES") {
+          testNext(port + 1, attemptsLeft - 1);
+        } else {
+          resolve(port);
+        }
+      });
+      tester.listen({ port, host: "127.0.0.1", exclusive: true }, () => {
+        tester.close(() => resolve(port));
+      });
+    };
+    testNext(startPort, maxAttempts);
+  });
+}
+
+// Ensure single instance (skip during CI smoke test and e2e test)
+if (!IS_SMOKE_TEST && !IS_E2E_TEST) {
+  const gotLock = app.requestSingleInstanceLock();
+  if (!gotLock) {
+    logStartup("SingleInstanceLock held by active instance; exiting secondary process.");
+    app.quit();
+  } else {
+    app.on("second-instance", () => {
+      logStartup("second-instance triggered.");
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        if (mainWindow.isMinimized()) mainWindow.restore();
+        mainWindow.show();
+        mainWindow.focus();
+      } else {
+        createWindows();
+      }
+    });
+  }
 }
 
 try {
@@ -156,6 +202,30 @@ globalThis.__glaidoElectronPaste = async (text, shouldPaste = false) => {
   } catch (err) {
     logStartup(`Paste error: ${err?.message || err}`);
   }
+};
+
+
+// Register native Electron microphone permission hooks for server.mjs
+globalThis.__glaidoRequestMicrophonePermission = async () => {
+  if (process.platform === "darwin" && typeof systemPreferences?.askForMediaAccess === "function") {
+    try {
+      return await systemPreferences.askForMediaAccess("microphone");
+    } catch (_) {
+      return false;
+    }
+  }
+  return true;
+};
+
+globalThis.__glaidoGetMicrophonePermissionStatus = () => {
+  if (process.platform === "darwin" && typeof systemPreferences?.getMediaAccessStatus === "function") {
+    try {
+      return systemPreferences.getMediaAccessStatus("microphone");
+    } catch (_) {
+      return "granted";
+    }
+  }
+  return "granted";
 };
 
 function invokeRpc(cmd, args = {}) {
@@ -484,10 +554,35 @@ function createWindows() {
     mainWindow.webContents.executeJavaScript(WEBAUDIO_MIC_CAPTURE_SCRIPT).catch(() => {});
   });
 
+  mainWindow.webContents.on("did-fail-load", (_event, errorCode, errorDescription, validatedURL) => {
+    logStartup(`Load failed for ${validatedURL}: [${errorCode}] ${errorDescription}`);
+    if (!isQuitting && (errorCode === -102 || errorCode === -105 || errorCode === -6)) {
+      setTimeout(() => {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.loadURL(`${BASE_URL}/`);
+        }
+      }, 350);
+    }
+  });
+
   mainWindow.on("close", (e) => {
     if (!isQuitting) {
-      e.preventDefault();
-      mainWindow.hide();
+      if (tray && !tray.isDestroyed()) {
+        e.preventDefault();
+        mainWindow.hide();
+        if (process.platform === "win32" && !hasShownTrayBalloon) {
+          hasShownTrayBalloon = true;
+          try {
+            tray.displayBalloon({
+              title: "Glaido Pro",
+              content: "Glaido Pro is running in the system tray. Press Alt+Space anywhere to dictate."
+            });
+          } catch (_) {}
+        }
+      } else {
+        isQuitting = true;
+        app.quit();
+      }
     }
   });
 
@@ -524,9 +619,301 @@ function createWindows() {
   overlayWindow.loadURL(`${BASE_URL}/overlay.html`);
 }
 
+async function runE2ETestSuite(serverReady) {
+  const artifactsDir =
+    process.env.GLAIDO_E2E_ARTIFACTS_DIR ||
+    path.join(process.cwd(), "e2e-artifacts", `${process.platform}-${Date.now()}`);
+  fs.mkdirSync(artifactsDir, { recursive: true });
+
+  console.log("================================================================================");
+  console.log(`[E2E] Starting Glaido Pro End-to-End Verification Suite (${process.platform} / ${process.arch})`);
+  console.log(`[E2E] Artifacts Directory: ${artifactsDir}`);
+  console.log("================================================================================");
+
+  // Watchdog timeout to prevent CI stall
+  const watchdog = setTimeout(() => {
+    console.error("[E2E CRITICAL] Watchdog timeout reached (45s). Forcing termination.");
+    if (winPasteWorker) {
+      try { winPasteWorker.kill(); } catch (_) {}
+    }
+    isQuitting = true;
+    app.exit(1);
+  }, 45000);
+  if (watchdog.unref) watchdog.unref();
+
+  try {
+    // 1. Verify Local Server & RPC Baseline
+    console.log("[E2E] Step 1/6: Verifying server readiness & RPC baseline...");
+    if (!serverReady) {
+      throw new Error(`Local backend server failed to become ready on ${BASE_URL}`);
+    }
+    const settingsBaseline = await invokeRpc("get_settings");
+    const micsBaseline = await invokeRpc("get_microphone_list");
+    console.log("[E2E] RPC Baseline: settings ok =", !!settingsBaseline, ", mics count =", micsBaseline?.length || 0);
+
+    // 2. Wait for MainWindow navigation & verify React hydration inside Chromium
+    console.log("[E2E] Step 2/6: Verifying MainWindow navigation and React #root rendering...");
+    if (!mainWindow) throw new Error("mainWindow is not initialized");
+
+    if (mainWindow.webContents.isLoading()) {
+      await new Promise((resolve) => {
+        mainWindow.webContents.once("did-finish-load", resolve);
+        mainWindow.webContents.once("did-fail-load", resolve);
+      });
+    }
+
+    let domDetails = null;
+    const domStart = Date.now();
+    const maxDomWaitMs = 30000;
+    while (Date.now() - domStart < maxDomWaitMs) {
+      try {
+        domDetails = await mainWindow.webContents.executeJavaScript(`
+          (function() {
+            const root = document.getElementById("root");
+            if (!root) return { mounted: false, reason: "root_not_found" };
+            const loader = root.querySelector(".startup-loader");
+            const childCount = root.children.length;
+            const innerHTML = root.innerHTML || "";
+            const text = (root.innerText || "").trim();
+            // React mounts, replacing the static startup-loader with real app components
+            const mounted = !loader && childCount > 0 && innerHTML.length > 200;
+            return {
+              mounted,
+              hasLoader: !!loader,
+              childCount,
+              htmlLength: innerHTML.length,
+              textSnippet: text.slice(0, 160).replace(/\\s+/g, " "),
+              buttonCount: document.querySelectorAll("button").length,
+              title: document.title
+            };
+          })()
+        `);
+        if (domDetails && domDetails.mounted) break;
+      } catch (_) {}
+      await new Promise((r) => setTimeout(r, 250));
+    }
+
+    if (!domDetails || !domDetails.mounted) {
+      throw new Error(`React failed to mount inside #root within 30s. Last DOM state: ${JSON.stringify(domDetails)}`);
+    }
+    console.log("[E2E] React #root mounted successfully in Chromium:", JSON.stringify(domDetails));
+
+    // 3. Verify Tauri IPC bridge calls directly from inside the Chromium Renderer
+    console.log("[E2E] Step 3/6: Verifying Tauri IPC invocations from inside Chromium renderer...");
+    const rendererIpc = await mainWindow.webContents.executeJavaScript(`
+      (async function() {
+        try {
+          if (!window.__TAURI_INTERNALS__ || typeof window.__TAURI_INTERNALS__.invoke !== "function") {
+            return { ok: false, error: "window.__TAURI_INTERNALS__.invoke missing" };
+          }
+          const appVersion = await window.__TAURI_INTERNALS__.invoke("plugin:app|version");
+          const osPlatform = await window.__TAURI_INTERNALS__.invoke("plugin:os|platform");
+          const settings = await window.__TAURI_INTERNALS__.invoke("get_settings");
+          const mics = await window.__TAURI_INTERNALS__.invoke("get_microphone_list");
+          return {
+            ok: true,
+            appVersion,
+            osPlatform,
+            hasSettings: !!settings,
+            micCount: Array.isArray(mics) ? mics.length : 0
+          };
+        } catch (err) {
+          return { ok: false, error: String(err?.message || err) };
+        }
+      })()
+    `);
+    if (!rendererIpc || !rendererIpc.ok) {
+      throw new Error(`Tauri IPC failed inside Chromium renderer: ${JSON.stringify(rendererIpc)}`);
+    }
+    console.log("[E2E] Chromium renderer Tauri IPC verified:", JSON.stringify(rendererIpc));
+
+    // 4. Verify Overlay Window
+    console.log("[E2E] Step 4/6: Verifying overlayWindow DOM & capsule structure...");
+    if (!overlayWindow) throw new Error("overlayWindow is not initialized");
+    if (overlayWindow.webContents.isLoading()) {
+      await new Promise((resolve) => {
+        overlayWindow.webContents.once("did-finish-load", resolve);
+        overlayWindow.webContents.once("did-fail-load", resolve);
+      });
+    }
+    const overlayDetails = await overlayWindow.webContents.executeJavaScript(`
+      (function() {
+        const root = document.getElementById("overlay-root");
+        return {
+          ok: !!root,
+          hasOverlayRoot: !!root,
+          childCount: root ? root.children.length : 0,
+          windowLabel: window.__GLAIDO_WINDOW_LABEL__
+        };
+      })()
+    `);
+    console.log("[E2E] Overlay window DOM verified:", JSON.stringify(overlayDetails));
+
+    // 5. Test Dictation Session Lifecycle via IPC, Overlay Visuals & Clipboard Write
+    console.log("[E2E] Step 5/6: Testing dictation lifecycle via IPC & clipboard write...");
+    const defaultAppName = process.platform === "win32" ? "Windows Desktop" : "macOS Desktop";
+    const defaultBundleId = process.platform === "win32" ? "com.microsoft.windows.desktop" : "com.apple.finder";
+
+    // 5a. Start Dictation
+    const startRes = await invokeRpc("mac_global_dictation_start", {
+      appName: defaultAppName,
+      bundleId: defaultBundleId
+    });
+    console.log("[E2E] mac_global_dictation_start result:", JSON.stringify(startRes));
+
+    // Show overlay window inactive so it paints the recording capsule
+    if (overlayWindow && !overlayWindow.isDestroyed()) {
+      positionOverlayWindow();
+      overlayWindow.showInactive();
+    }
+    await new Promise((r) => setTimeout(r, 600));
+
+    // Capture overlay screenshot DURING active dictation
+    console.log("[E2E] Capturing real PNG screenshot of overlayWindow during recording...");
+    const overlayImg = await overlayWindow.webContents.capturePage();
+    const overlayPng = overlayImg.toPNG();
+    const overlayScreenshotPath = path.join(artifactsDir, "overlay-dictation-active.png");
+    fs.writeFileSync(overlayScreenshotPath, overlayPng);
+    console.log(`[E2E] Overlay screenshot saved: ${overlayScreenshotPath} (${overlayPng.length} bytes)`);
+
+    // 5b. Stop Dictation with test transcript
+    const testTranscript = "Glaido Pro Windows and macOS E2E Pipeline Verified";
+    console.log(`[E2E] Stopping dictation with spokenText="${testTranscript}"...`);
+    const stopRes = await invokeRpc("mac_global_dictation_stop", {
+      appName: defaultAppName,
+      bundleId: defaultBundleId,
+      spokenText: testTranscript
+    });
+    console.log("[E2E] mac_global_dictation_stop result:", JSON.stringify(stopRes));
+
+    // Wait for clipboard write & hide overlay
+    await new Promise((r) => setTimeout(r, 600));
+    if (overlayWindow && !overlayWindow.isDestroyed()) {
+      overlayWindow.hide();
+    }
+
+    // 5c. Verify Clipboard Readback
+    const clipboardText = clipboard.readText();
+    console.log("[E2E] Clipboard readback text:", JSON.stringify(clipboardText));
+    const clipboardMatched = clipboardText.includes("Glaido Pro") || clipboardText.includes("Pipeline");
+    if (!clipboardMatched) {
+      throw new Error(`Clipboard text did not match expected transcript. Got: "${clipboardText}"`);
+    }
+    console.log("[E2E] Native clipboard write & readback VERIFIED!");
+
+    // 6. Capture MainWindow Screenshot & Generate Summary
+    console.log("[E2E] Step 6/6: Capturing mainWindow screenshot and generating test report...");
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.show();
+      mainWindow.focus();
+    }
+    await new Promise((r) => setTimeout(r, 500));
+
+    const mainImg = await mainWindow.webContents.capturePage();
+    const mainPng = mainImg.toPNG();
+    const mainScreenshotPath = path.join(artifactsDir, "mainWindow-react-dashboard.png");
+    fs.writeFileSync(mainScreenshotPath, mainPng);
+    console.log(`[E2E] MainWindow screenshot saved: ${mainScreenshotPath} (${mainPng.length} bytes)`);
+
+    const allPassed =
+      Boolean(serverReady) &&
+      Boolean(domDetails?.mounted) &&
+      Boolean(rendererIpc?.ok) &&
+      Boolean(overlayDetails?.hasOverlayRoot) &&
+      Boolean(startRes?.result?.started || startRes?.started) &&
+      Boolean(stopRes) &&
+      Boolean(clipboardMatched) &&
+      mainPng.length > 1000 &&
+      overlayPng.length > 500;
+
+    const report = {
+      testSuite: "Glaido Pro Comprehensive End-to-End Verification",
+      status: allPassed ? "PASSED" : "FAILED",
+      platform: process.platform,
+      arch: process.arch,
+      timestamp: new Date().toISOString(),
+      durationMs: Date.now() - domStart,
+      checks: {
+        serverReady,
+        reactMounted: domDetails?.mounted || false,
+        domDetails,
+        rendererIpc,
+        overlayDetails,
+        dictationStart: startRes,
+        dictationStop: stopRes,
+        clipboardVerified: clipboardMatched,
+        clipboardText,
+        screenshots: {
+          mainWindow: { path: mainScreenshotPath, bytes: mainPng.length },
+          overlayWindow: { path: overlayScreenshotPath, bytes: overlayPng.length }
+        }
+      }
+    };
+
+    const reportPath = path.join(artifactsDir, "e2e-summary.json");
+    fs.writeFileSync(reportPath, JSON.stringify(report, null, 2));
+    console.log(`[E2E] Comprehensive test report saved to: ${reportPath}`);
+    console.log("================================================================================");
+    console.log(`[E2E] ALL CHECKS PASSED: ${allPassed ? "SUCCESS" : "FAILURE"}`);
+    console.log("================================================================================");
+
+    clearTimeout(watchdog);
+    if (winPasteWorker) {
+      try { winPasteWorker.kill(); } catch (_) {}
+    }
+    isQuitting = true;
+    app.exit(allPassed ? 0 : 1);
+  } catch (err) {
+    clearTimeout(watchdog);
+    console.error("[E2E FAILED] Error during end-to-end test execution:", err);
+
+    try {
+      const failReport = {
+        testSuite: "Glaido Pro Comprehensive End-to-End Verification",
+        status: "FAILED",
+        error: String(err?.stack || err?.message || err),
+        platform: process.platform,
+        arch: process.arch,
+        timestamp: new Date().toISOString()
+      };
+      fs.writeFileSync(path.join(artifactsDir, "e2e-summary.json"), JSON.stringify(failReport, null, 2));
+    } catch (_) {}
+
+    if (winPasteWorker) {
+      try { winPasteWorker.kill(); } catch (_) {}
+    }
+    isQuitting = true;
+    app.exit(1);
+  }
+}
+
 app.whenReady().then(async () => {
   logStartup(`Starting Glaido Pro (${process.platform})...`);
   startWindowsPasteWorker();
+
+  // Dynamically pick an available localhost port starting at 4321 so EADDRINUSE never occurs
+  const chosenPort = await findAvailablePort(PORT);
+  PORT = chosenPort;
+  BASE_URL = `http://127.0.0.1:${PORT}`;
+  process.env.PORT = String(PORT);
+  logStartup(`Selected available localhost port: ${PORT}`);
+
+  // Proactively request macOS microphone permission so TCC prompt appears on launch
+  if (process.platform === "darwin" && typeof systemPreferences?.askForMediaAccess === "function") {
+    try {
+      const currentStatus = systemPreferences.getMediaAccessStatus("microphone");
+      logStartup(`macOS initial microphone access status: ${currentStatus}`);
+      if (currentStatus !== "granted") {
+        systemPreferences.askForMediaAccess("microphone").then((granted) => {
+          logStartup(`macOS askForMediaAccess(microphone) returned: ${granted}`);
+        }).catch((err) => {
+          logStartup(`macOS askForMediaAccess error: ${err?.message || err}`);
+        });
+      }
+    } catch (err) {
+      logStartup(`macOS media access check error: ${err?.message || err}`);
+    }
+  }
 
   try {
     const serverModuleUrl = pathToFileURL(path.join(__dirname, "server.mjs")).href;
@@ -581,6 +968,10 @@ app.whenReady().then(async () => {
         toggleGlobalDictation();
       });
     } catch (_) {}
+  }
+
+  if (IS_E2E_TEST) {
+    await runE2ETestSuite(ready);
   }
 });
 

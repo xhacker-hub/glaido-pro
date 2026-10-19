@@ -21,7 +21,7 @@
     "electron-builder": "^25.1.8"
   },
   "build": {
-    "appId": "com.pranavgoel.glaidopro",
+    "appId": "com.pranavgoel.glaidopro.v2",
     "productName": "Glaido Pro",
     "asar": false,
     "files": [
@@ -35,11 +35,15 @@
       "target": [
         {
           "target": "nsis",
-          "arch": ["x64"]
+          "arch": [
+            "x64"
+          ]
         },
         {
           "target": "portable",
-          "arch": ["x64"]
+          "arch": [
+            "x64"
+          ]
         }
       ],
       "signAndEditExecutable": false
@@ -60,15 +64,26 @@
       "target": [
         {
           "target": "dmg",
-          "arch": ["arm64"]
+          "arch": [
+            "arm64"
+          ]
         },
         {
           "target": "zip",
-          "arch": ["arm64"]
+          "arch": [
+            "arm64"
+          ]
         }
       ],
       "identity": null,
-      "artifactName": "Glaido-Pro-macOS-${arch}-${version}.${ext}"
-    }
+      "artifactName": "Glaido-Pro-macOS-${arch}-${version}.${ext}",
+      "extendInfo": {
+        "NSMicrophoneUsageDescription": "Glaido Pro requires microphone access for live voice dictation and real-time waveform visualization.",
+        "NSAppleEventsUsageDescription": "Glaido Pro requires Apple Events access to paste transcribed text into your active application."
+      },
+      "entitlements": "macos-agent/entitlements.plist",
+      "entitlementsInherit": "macos-agent/entitlements.plist"
+    },
+    "afterPack": "./scripts/after-pack-mac.cjs"
   }
 }
