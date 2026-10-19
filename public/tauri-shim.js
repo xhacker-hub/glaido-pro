@@ -112,15 +112,28 @@
     }
   };
 
-  window.__TAURI_OS_PLUGIN_INTERNALS__ = {
-    arch: "aarch64",
-    eol: "\n",
-    exe_extension: "",
-    family: "unix",
-    os_type: "macos",
-    platform: "macos",
-    version: "15.4.0"
-  };
+  const isWindowsClient =
+    typeof navigator !== "undefined" && /win/i.test(navigator.userAgent || "") && !/darwin|mac/i.test(navigator.userAgent || "");
+
+  window.__TAURI_OS_PLUGIN_INTERNALS__ = isWindowsClient
+    ? {
+        arch: "x86_64",
+        eol: "\r\n",
+        exe_extension: "exe",
+        family: "windows",
+        os_type: "windows",
+        platform: "windows",
+        version: "10.0.22631"
+      }
+    : {
+        arch: "aarch64",
+        eol: "\n",
+        exe_extension: "",
+        family: "unix",
+        os_type: "macos",
+        platform: "macos",
+        version: "15.4.0"
+      };
 
   window.__TAURI_INTERNALS__ = {
     metadata: {
@@ -140,10 +153,15 @@
       ]
     },
     plugins: {
-      path: {
-        sep: "/",
-        delimiter: ":"
-      }
+      path: isWindowsClient
+        ? {
+            sep: "\\",
+            delimiter: ";"
+          }
+        : {
+            sep: "/",
+            delimiter: ":"
+          }
     },
     transformCallback: registerCallback,
     convertFileSrc(filePath, _protocol = "asset") {
@@ -200,9 +218,9 @@
       if (cmd === "plugin:app|version") return "0.4.3";
       if (cmd === "plugin:app|name") return "Glaido";
       if (cmd === "plugin:app|tauri_version") return "2.11.5";
-      if (cmd === "plugin:os|platform" || cmd === "plugin:os|os_type") return "macos";
-      if (cmd === "plugin:os|arch") return "aarch64";
-      if (cmd === "plugin:os|version") return "15.4.0";
+      if (cmd === "plugin:os|platform" || cmd === "plugin:os|os_type") return isWindowsClient ? "windows" : "macos";
+      if (cmd === "plugin:os|arch") return isWindowsClient ? "x86_64" : "aarch64";
+      if (cmd === "plugin:os|version") return isWindowsClient ? "10.0.22631" : "15.4.0";
       if (cmd === "plugin:os|locale") return "en-US";
       if (cmd === "plugin:window|get_all_windows") {
         return ["main", "overlay", "command-modal", "toast-overlay"];
@@ -395,6 +413,24 @@
 
   function mountHotkeyCaptureSupport() {
     function formatKeyEventLabel(e) {
+      if (isWindowsClient) {
+        if (e.code === "AltRight") return { primary: "Right Alt", short: "Right Alt" };
+        if (e.code === "AltLeft") return { primary: "Left Alt", short: "Left Alt" };
+        if (e.code === "ControlRight") return { primary: "Right Ctrl", short: "Right Ctrl" };
+        if (e.code === "ShiftRight") return { primary: "Right Shift", short: "Right Shift" };
+        const mods = [];
+        if (e.ctrlKey && !e.code.startsWith("Control")) mods.push("Ctrl");
+        if (e.altKey && !e.code.startsWith("Alt")) mods.push("Alt");
+        if (e.shiftKey && !e.code.startsWith("Shift")) mods.push("Shift");
+        if (e.metaKey && !e.code.startsWith("Meta")) mods.push("Win");
+        const keyName = e.code === "Space" ? "Space" : e.code.replace(/^Key|^Digit/, "");
+        const shortMods = mods.join("+");
+        return {
+          primary: keyName,
+          modifiers: mods,
+          short: shortMods ? `${shortMods}+${keyName}` : keyName
+        };
+      }
       if (e.code === "AltRight") return { primary: "Right Option", short: "Right ⌥" };
       if (e.code === "AltLeft") return { primary: "Left Option", short: "Left ⌥" };
       if (e.code === "ControlRight") return { primary: "Right Control", short: "Right ⌃" };

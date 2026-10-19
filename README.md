@@ -1,44 +1,29 @@
-# Glaido Pro — Cross-Platform AI Voice Dictation & Command Mode (Windows `.exe` & macOS)
+# Glaido Pro (`v0.4.3`) — Dedicated Editions for Windows PC & macOS
 
-100% unlocked, local-first **Glaido Pro** (`v0.4.3`) desktop application for **Windows PC** and **macOS**:
-
-## 📥 Download for Windows PC (`.exe`)
-
-No coding, terminal, or external dependencies needed—just download and run like any standard Windows app:
-
-- **[⬇️ Download `Glaido-Pro-Setup-0.4.3.exe` (Windows Installer)](https://github.com/xhacker-hub/glaido-pro/releases/download/v0.4.3/Glaido-Pro-Setup-0.4.3.exe)** — Installs Glaido Pro with Desktop & Start Menu shortcuts and automatic Windows startup support.
-- **[⬇️ Download `Glaido-Pro-Portable-0.4.3.exe` (Standalone Portable `.exe`)](https://github.com/xhacker-hub/glaido-pro/releases/download/v0.4.3/Glaido-Pro-Portable-0.4.3.exe)** — Single-file portable `.exe` you can run immediately from anywhere without installing.
-- **[📦 View All Releases on GitHub](https://github.com/xhacker-hub/glaido-pro/releases/tag/v0.4.3)**
-
-### How to Use on Windows
-1. Run **`Glaido-Pro-Setup-0.4.3.exe`** (or **`Glaido-Pro-Portable-0.4.3.exe`**).
-2. Glaido Pro opens its main dashboard and sits in your **Windows System Tray** (bottom-right taskbar).
-3. Press **`Alt + Space`** (or **`Ctrl + Shift + Space`**) inside any Windows application to pop up the bottom-center live waveform capsule, speak naturally, and press **`Alt + Space`** again to automatically transcribe and paste (`Ctrl+V`) into your active window.
+Two separate, 100% native builds tailored specifically for **Windows PC** and **macOS**:
 
 ---
 
-## Features
-- **Exact Original Glaido UI**: All 4 native surfaces (`main` dashboard, bottom-center floating `overlay.html` capsule with live 60fps spring-physics waveform, `command-modal.html` Command Island, and `correction-toast.html`).
-- **Dual-Engine Low-Latency Speech Recognition**:
-  - **Local Neural Whisper Engine (`whisper.cpp` Metal GPU / CPU)**: Conditioned directly on your Personal Dictionary (`Antigravity`, `Glaido`, `Higgsfield AI`, `GrokBot`, `Agentic OS`, `Droppy`, etc.).
-  - **Automatic Zero-Install Fallback**: Built-in keep-alive HTTPS streaming speech engine (`enhanceAndNormalizePcm` + 5-hypothesis context reranker) + native Windows WASAPI & bundled `ffmpeg` microphone capture.
-  - **Optional Cloud Whisper Turbo**: Plug in a Groq (`whisper-large-v3-turbo`) or OpenAI (`whisper-1`) key anytime in Settings.
-- **Full SQLite Persistence (`node:sqlite`)**: History, Personal Dictionary, Spoken Snippets (`{gl.clipboard}`, `{gl.datetime}`, `{gl.timezone}`), Per-App Formatting Rules, Analytics, and 11 Built-in MCP Tools.
+## 🪟 1. Pure Windows Edition (`.exe` for Windows 10 / 11)
+
+Built exclusively for Windows with native **WASAPI + DirectShow** microphone capture, **Windows System Tray** integration, **`Alt + Space`** global hotkey, instant **`Ctrl + V`** Win32 `keybd_event` auto-paste, and embedded WASM SQLite persistence (`%APPDATA%\Glaido Pro\glaido-windows.db`).
+
+- **[⬇️ Download `Glaido-Pro-Windows-Setup-0.4.3.exe` (Windows Installer)](https://github.com/xhacker-hub/glaido-pro/releases/download/v0.4.3/Glaido-Pro-Windows-Setup-0.4.3.exe)** — Standard Windows installer with Desktop & Start Menu shortcuts and Windows Startup auto-launch.
+- **[⬇️ Download `Glaido-Pro-Windows-Portable-0.4.3.exe` (Windows Portable `.exe`)](https://github.com/xhacker-hub/glaido-pro/releases/download/v0.4.3/Glaido-Pro-Windows-Portable-0.4.3.exe)** — Single-click standalone `.exe` (no installation required).
+
+### Windows Controls
+- **Dictate & Auto-Paste (`Ctrl+V`)**: Press **`Alt + Space`** (or **`Ctrl + Shift + Space`**) in any Windows app (VS Code, Chrome, Cursor, Discord, Notepad, Word), speak naturally, and press **`Alt + Space`** again to transcribe and paste immediately.
+- **System Tray**: Lives in the bottom-right Windows System Tray so closing the window keeps voice dictation ready in the background.
 
 ---
 
-## Quick Start on macOS (Apple Silicon / Intel)
+## 🍎 2. Pure macOS Edition (`.dmg` & `.zip` for Apple Silicon Mac)
 
-```bash
-brew install node ffmpeg whisper-cpp
-git clone https://github.com/xhacker-hub/glaido-pro.git
-cd glaido-pro
+Built exclusively for macOS with native **`Right Option` / `Fn` / `⌥ + Space`** hotkeys, **`MacBook Pro Microphone`** (`AVFoundation`) capture, **Apple M4 Pro Metal GPU `whisper.cpp`** neural acceleration, and **`⌘ + V`** auto-paste.
 
-# Download the 181MB Whisper small.en model for Apple Silicon Metal GPU acceleration
-mkdir -p data/models
-curl -L -o data/models/ggml-small.en-q5_1.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en-q5_1.bin
+- **[⬇️ Download `Glaido-Pro-macOS-arm64-0.4.3.dmg` (macOS Disk Image Installer)](https://github.com/xhacker-hub/glaido-pro/releases/download/v0.4.3/Glaido-Pro-macOS-arm64-0.4.3.dmg)** — Drag `Glaido Pro.app` to your `/Applications` folder.
+- **[⬇️ Download `Glaido-Pro-macOS-arm64-0.4.3.zip` (macOS `.app` Archive)](https://github.com/xhacker-hub/glaido-pro/releases/download/v0.4.3/Glaido-Pro-macOS-arm64-0.4.3.zip)** — Direct `.app` bundle zip for macOS.
 
-# Start the keepalive backend + open the native macOS app
-./keepalive-server.sh &
-open "Glaido Dictate.app"
-```
+---
+
+📦 **[View All Downloads on GitHub Releases (`v0.4.3`)](https://github.com/xhacker-hub/glaido-pro/releases/tag/v0.4.3)**

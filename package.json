@@ -2,17 +2,19 @@
   "name": "glaido-pro",
   "productName": "Glaido Pro",
   "version": "0.4.3",
-  "description": "Glaido Pro — Ultra-fast AI Voice Dictation & Command Island for Windows and macOS",
+  "description": "Glaido Pro — Dedicated Native Editions for Windows PC (.exe) and macOS (.dmg / .app)",
   "main": "electron-main.cjs",
   "author": "Pranav Goel",
   "license": "MIT",
   "scripts": {
     "start": "node server.mjs",
     "electron": "electron .",
-    "dist:win": "electron-builder --win nsis portable --x64 --publish never"
+    "dist:win": "electron-builder --win nsis portable --x64 --publish never",
+    "dist:mac": "electron-builder --mac dmg zip --arm64 --publish never"
   },
   "dependencies": {
-    "ffmpeg-static": "^5.2.0"
+    "ffmpeg-static": "^5.2.0",
+    "sql.js": "^1.12.0"
   },
   "devDependencies": {
     "electron": "^34.3.0",
@@ -48,10 +50,25 @@
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
       "shortcutName": "Glaido Pro",
-      "artifactName": "Glaido-Pro-Setup-${version}.exe"
+      "artifactName": "Glaido-Pro-Windows-Setup-${version}.exe"
     },
     "portable": {
-      "artifactName": "Glaido-Pro-Portable-${version}.exe"
+      "artifactName": "Glaido-Pro-Windows-Portable-${version}.exe"
+    },
+    "mac": {
+      "category": "public.app-category.productivity",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": ["arm64"]
+        },
+        {
+          "target": "zip",
+          "arch": ["arm64"]
+        }
+      ],
+      "identity": null,
+      "artifactName": "Glaido-Pro-macOS-${arch}-${version}.${ext}"
     }
   }
 }

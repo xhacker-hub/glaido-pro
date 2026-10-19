@@ -1,4 +1,4 @@
-name: Build Windows .exe Release
+name: Build Pure Windows (.exe) & Pure macOS (.dmg) Releases
 
 on:
   push:
@@ -10,7 +10,8 @@ permissions:
   contents: write
 
 jobs:
-  build-windows:
+  build-pure-windows:
+    name: Pure Windows Edition (.exe)
     runs-on: windows-latest
     steps:
       - name: Checkout repository
@@ -24,22 +25,77 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      - name: Build Windows Installer & Portable .exe
+      - name: Build Pure Windows Installer & Portable .exe
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: npm run dist:win
 
-      - name: Publish .exe Release Assets to GitHub Releases
+      - name: Smoke-Test Built Windows Executable on Windows Runner
+        shell: pwsh
+        run: |
+          $unpackedExe = "dist\win-unpacked\Glaido Pro.exe"
+          if (-not (Test-Path $unpackedExe)) {
+            Write-Error "Unpacked Windows executable not found at $unpackedExe"
+            exit 1
+          }
+          Write-Host "Running live Windows smoke test on $unpackedExe..."
+          $proc = Start-Process -FilePath $unpackedExe -ArgumentList "--smoke-test" -PassThru -Wait -NoNewWindow
+          if ($proc.ExitCode -ne 0) {
+            $logPath = Join-Path $env:APPDATA "Glaido Pro\glaido-startup.log"
+            if (Test-Path $logPath) { Get-Content $logPath }
+            Write-Error "Windows smoke test exited with code $($proc.ExitCode)"
+            exit 1
+          }
+          Write-Host "Windows .exe smoke test PASSED!"
+
+      - name: Publish Pure Windows .exe Assets to GitHub Releases
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: pwsh
         run: |
-          $exeFiles = Get-ChildItem -Path "dist\*.exe" | Select-Object -ExpandProperty FullName
-          Write-Host "Built .exe files:"
+          $exeFiles = Get-ChildItem -Path "dist\Glaido-Pro-Windows-*.exe" | Select-Object -ExpandProperty FullName
+          Write-Host "Built Pure Windows .exe files:"
           $exeFiles | ForEach-Object { Write-Host " - $_" }
           gh release view v0.4.3 2>$null
           if ($LASTEXITCODE -eq 0) {
             gh release upload v0.4.3 $exeFiles --clobber
           } else {
-            gh release create v0.4.3 $exeFiles --title "Glaido Pro v0.4.3 — Windows .exe Installer & Portable" --notes "Download **Glaido-Pro-Setup-0.4.3.exe** (Standard Windows Installer with Desktop & Start Menu shortcuts) or **Glaido-Pro-Portable-0.4.3.exe** (Single-click standalone portable executable). Press **Alt+Space** in any Windows app to dictate and auto-paste."
+            gh release create v0.4.3 $exeFiles --title "Glaido Pro v0.4.3 — Pure Windows (.exe) & Pure macOS (.dmg) Editions" --notes "Two dedicated native editions: **Pure Windows Edition** (`Glaido-Pro-Windows-Setup-0.4.3.exe` & `Glaido-Pro-Windows-Portable-0.4.3.exe`) and **Pure macOS Edition** (`Glaido-Pro-macOS-arm64-0.4.3.dmg` & `Glaido-Pro-macOS-arm64-0.4.3.zip`)."
           }
+
+  build-pure-macos:
+    name: Pure macOS Edition (.dmg / .zip)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build Pure macOS .dmg & .zip
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: npm run dist:mac
+
+      - name: Smoke-Test Built macOS App Bundle
+        run: |
+          "./dist/mac-arm64/Glaido Pro.app/Contents/MacOS/Glaido Pro" --smoke-test
+
+      - name: Publish Pure macOS Assets to GitHub Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for i in 1 2 3; do
+            if gh release view v0.4.3 >/dev/null 2>&1; then
+              gh release upload v0.4.3 dist/Glaido-Pro-macOS-* --clobber && break
+            else
+              gh release create v0.4.3 dist/Glaido-Pro-macOS-* --title "Glaido Pro v0.4.3 — Pure Windows (.exe) & Pure macOS (.dmg) Editions" --notes "Two dedicated native editions: **Pure Windows Edition** and **Pure macOS Edition**." && break
+            fi
+            sleep 3
+          done

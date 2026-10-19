@@ -7,14 +7,18 @@ const {
   screen,
   nativeImage,
   session,
-  shell
+  shell,
+  clipboard
 } = require("electron");
 const path = require("node:path");
+const fs = require("node:fs");
 const http = require("node:http");
+const { spawn, execFile } = require("node:child_process");
 const { pathToFileURL } = require("node:url");
 
 const PORT = Number(process.env.PORT || 4321);
 const BASE_URL = `http://127.0.0.1:${PORT}`;
+const IS_SMOKE_TEST = process.argv.includes("--smoke-test") || process.env.GLAIDO_SMOKE_TEST === "1";
 
 let mainWindow = null;
 let overlayWindow = null;
@@ -22,29 +26,137 @@ let tray = null;
 let isQuitting = false;
 let isRecording = false;
 let isProcessing = false;
+let winPasteWorker = null;
 
-// Ensure single instance
-const gotLock = app.requestSingleInstanceLock();
-if (!gotLock) {
-  app.quit();
-} else {
-  app.on("second-instance", () => {
-    if (mainWindow) {
-      if (mainWindow.isMinimized()) mainWindow.restore();
-      mainWindow.show();
-      mainWindow.focus();
-    }
-  });
+// Ensure single instance (skip during CI smoke test)
+if (!IS_SMOKE_TEST) {
+  const gotLock = app.requestSingleInstanceLock();
+  if (!gotLock) {
+    app.quit();
+  } else {
+    app.on("second-instance", () => {
+      if (mainWindow) {
+        if (mainWindow.isMinimized()) mainWindow.restore();
+        mainWindow.show();
+        mainWindow.focus();
+      }
+    });
+  }
 }
 
 // Configure writable data directory & bundled ffmpeg before importing server.mjs
-process.env.GLAIDO_DATA_DIR = app.getPath("userData");
+const userDataDir = app.getPath("userData");
+fs.mkdirSync(userDataDir, { recursive: true });
+process.env.GLAIDO_DATA_DIR = userDataDir;
+process.env.GLAIDO_TARGET_OS = process.platform === "win32" ? "windows" : "macos";
+
+const logFilePath = path.join(userDataDir, "glaido-startup.log");
+function logStartup(msg) {
+  try {
+    fs.appendFileSync(logFilePath, `[${new Date().toISOString()}] ${msg}\n`);
+  } catch (_) {}
+}
+
 try {
   const ffmpegStatic = require("ffmpeg-static");
-  if (ffmpegStatic) {
+  if (ffmpegStatic && fs.existsSync(ffmpegStatic)) {
     process.env.FFMPEG_BIN = ffmpegStatic;
+    logStartup(`Bundled ffmpeg resolved: ${ffmpegStatic}`);
   }
-} catch (_) {}
+} catch (err) {
+  logStartup(`ffmpeg-static note: ${err?.message || err}`);
+}
+
+// Persistent low-latency Win32 keybd_event paste worker on Windows
+function startWindowsPasteWorker() {
+  if (process.platform !== "win32" || winPasteWorker) return;
+  try {
+    const psScript = `
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class GlaidoWinInput {
+  [DllImport("user32.dll")]
+  public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+  public static void SendCtrlV() {
+    // Release Alt/Shift if user was holding hotkey
+    keybd_event(0x12, 0, 2, UIntPtr.Zero);
+    // Press Ctrl + V
+    keybd_event(0x11, 0, 0, UIntPtr.Zero);
+    keybd_event(0x56, 0, 0, UIntPtr.Zero);
+    System.Threading.Thread.Sleep(15);
+    keybd_event(0x56, 0, 2, UIntPtr.Zero);
+    keybd_event(0x11, 0, 2, UIntPtr.Zero);
+  }
+}
+"@
+while ($true) {
+  $line = [Console]::In.ReadLine()
+  if ($null -eq $line) { break }
+  if ($line -eq "PASTE") {
+    [GlaidoWinInput]::SendCtrlV()
+  }
+}
+`;
+    winPasteWorker = spawn(
+      "powershell.exe",
+      ["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", psScript],
+      { stdio: ["pipe", "ignore", "ignore"], windowsHide: true }
+    );
+    winPasteWorker.on("exit", () => {
+      winPasteWorker = null;
+    });
+    winPasteWorker.on("error", () => {
+      winPasteWorker = null;
+    });
+  } catch (_) {
+    winPasteWorker = null;
+  }
+}
+
+// Register native Electron clipboard + instant paste hook for server.mjs
+globalThis.__glaidoElectronPaste = async (text, shouldPaste = false) => {
+  if (!text) return;
+  try {
+    clipboard.writeText(String(text));
+    if (shouldPaste) {
+      if (process.platform === "win32") {
+        if (winPasteWorker && winPasteWorker.stdin && !winPasteWorker.stdin.destroyed) {
+          setTimeout(() => {
+            try {
+              winPasteWorker.stdin.write("PASTE\n");
+            } catch (_) {}
+          }, 30);
+        } else {
+          setTimeout(() => {
+            execFile(
+              "powershell.exe",
+              [
+                "-NoProfile",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('^v')"
+              ],
+              { windowsHide: true },
+              () => {}
+            );
+          }, 30);
+        }
+      } else if (process.platform === "darwin") {
+        setTimeout(() => {
+          execFile(
+            "/usr/bin/osascript",
+            ["-e", 'tell application "System Events" to keystroke "v" using command down'],
+            () => {}
+          );
+        }, 20);
+      }
+    }
+  } catch (err) {
+    logStartup(`Paste error: ${err?.message || err}`);
+  }
+};
 
 function invokeRpc(cmd, args = {}) {
   return new Promise((resolve) => {
@@ -76,7 +188,7 @@ function invokeRpc(cmd, args = {}) {
   });
 }
 
-function waitForServerReady(retries = 60) {
+function waitForServerReady(retries = 80) {
   return new Promise((resolve) => {
     const attempt = (rem) => {
       const req = http.get(`${BASE_URL}/`, (res) => {
@@ -93,7 +205,13 @@ function waitForServerReady(retries = 60) {
 }
 
 function createTrayIconImage(recording = false) {
-  // Generate a crisp 16x16 RGBA icon programmatically so it never fails to load
+  const iconPath = path.join(__dirname, "public", "app-icons", "com.google.antigravity-ide.png");
+  if (!recording && fs.existsSync(iconPath)) {
+    const img = nativeImage.createFromPath(iconPath);
+    if (!img.isEmpty()) {
+      return img.resize({ width: 16, height: 16 });
+    }
+  }
   const size = 16;
   const buf = Buffer.alloc(size * size * 4);
   const cx = 7.5;
@@ -106,13 +224,11 @@ function createTrayIconImage(recording = false) {
       const idx = (y * size + x) * 4;
       if (dist <= 7.0) {
         if (recording) {
-          // Vibrant red recording dot (BGRA on Windows/Electron nativeImage fromBitmap or RGBA via PNG data URL)
           buf[idx] = 239;
           buf[idx + 1] = 68;
           buf[idx + 2] = 68;
           buf[idx + 3] = 255;
         } else {
-          // Sleek dark obsidian badge with white waveform bars
           const isBar =
             (Math.abs(x - 5) <= 0.6 && Math.abs(y - 7.5) <= 2.5) ||
             (Math.abs(x - 8) <= 0.6 && Math.abs(y - 7.5) <= 4.2) ||
@@ -126,24 +242,22 @@ function createTrayIconImage(recording = false) {
       }
     }
   }
-  const iconPath = path.join(__dirname, "public", "app-icons", "com.google.antigravity-ide.png");
-  if (!recording && require("node:fs").existsSync(iconPath)) {
-    const img = nativeImage.createFromPath(iconPath);
-    if (!img.isEmpty()) {
-      return img.resize({ width: 16, height: 16 });
-    }
-  }
   return nativeImage.createFromBuffer(buf, { width: size, height: size });
 }
 
 function updateTrayMenu() {
   if (!tray) return;
-  const loginSettings = app.getLoginItemSettings();
+  const hotkeyLabel = process.platform === "win32" ? "Alt+Space" : "Option+Space";
+  let openAtLogin = false;
+  try {
+    openAtLogin = Boolean(app.getLoginItemSettings().openAtLogin);
+  } catch (_) {}
+
   const contextMenu = Menu.buildFromTemplate([
     {
       label: isRecording
-        ? "Stop Dictation & Paste (Alt+Space)"
-        : "Start Voice Dictation (Alt+Space)",
+        ? `Stop Dictation & Paste (${hotkeyLabel})`
+        : `Start Voice Dictation (${hotkeyLabel})`,
       click: () => toggleGlobalDictation()
     },
     { type: "separator" },
@@ -157,11 +271,13 @@ function updateTrayMenu() {
       }
     },
     {
-      label: "Launch Glaido Pro at Windows Login",
+      label: process.platform === "win32" ? "Launch at Windows Startup" : "Launch at macOS Login",
       type: "checkbox",
-      checked: Boolean(loginSettings.openAtLogin),
+      checked: openAtLogin,
       click: (item) => {
-        app.setLoginItemSettings({ openAtLogin: item.checked });
+        try {
+          app.setLoginItemSettings({ openAtLogin: item.checked });
+        } catch (_) {}
       }
     },
     { type: "separator" },
@@ -173,12 +289,18 @@ function updateTrayMenu() {
       }
     }
   ]);
-  tray.setToolTip(isRecording ? "Glaido Pro — Recording..." : "Glaido Pro — Voice Dictation (Alt+Space)");
+  tray.setToolTip(
+    isRecording ? "Glaido Pro — Recording..." : `Glaido Pro — Voice Dictation (${hotkeyLabel})`
+  );
   tray.setContextMenu(contextMenu);
 }
 
 async function toggleGlobalDictation() {
   if (isProcessing) return;
+  const defaultAppName = process.platform === "win32" ? "Windows Desktop" : "macOS Desktop";
+  const defaultBundleId =
+    process.platform === "win32" ? "com.microsoft.windows.desktop" : "com.apple.finder";
+
   if (!isRecording) {
     isRecording = true;
     updateTrayMenu();
@@ -187,16 +309,16 @@ async function toggleGlobalDictation() {
       overlayWindow.showInactive();
     }
     await invokeRpc("mac_global_dictation_start", {
-      appName: "Windows Desktop",
-      bundleId: "com.microsoft.windows.desktop"
+      appName: defaultAppName,
+      bundleId: defaultBundleId
     });
   } else {
     isRecording = false;
     isProcessing = true;
     updateTrayMenu();
     await invokeRpc("mac_global_dictation_stop", {
-      appName: "Windows Desktop",
-      bundleId: "com.microsoft.windows.desktop"
+      appName: defaultAppName,
+      bundleId: defaultBundleId
     });
     isProcessing = false;
     if (overlayWindow && !overlayWindow.isDestroyed()) {
@@ -260,8 +382,79 @@ function subscribeToServerEvents() {
   connect();
 }
 
+const WEBAUDIO_MIC_CAPTURE_SCRIPT = `
+(function() {
+  if (window.__glaidoWinMicInitialized) return;
+  window.__glaidoWinMicInitialized = true;
+  let audioCtx = null;
+  let mediaStream = null;
+  let processor = null;
+  let active = false;
+
+  async function startWebAudioCapture() {
+    if (active) return;
+    active = true;
+    try {
+      mediaStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+          channelCount: 1,
+          sampleRate: 16000
+        }
+      });
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+      const source = audioCtx.createMediaStreamSource(mediaStream);
+      processor = audioCtx.createScriptProcessor(1024, 1, 1);
+      processor.onaudioprocess = (e) => {
+        if (!active) return;
+        const input = e.inputBuffer.getChannelData(0);
+        const pcm16 = new Int16Array(input.length);
+        for (let i = 0; i < input.length; i++) {
+          const s = Math.max(-1, Math.min(1, input[i]));
+          pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+        }
+        const bytes = new Uint8Array(pcm16.buffer);
+        let binary = "";
+        for (let i = 0; i < bytes.byteLength; i++) {
+          binary += String.fromCharCode(bytes[i]);
+        }
+        const pcmBase64 = btoa(binary);
+        fetch("/api/invoke", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ cmd: "push_pcm_chunk", args: { pcmBase64 } })
+        }).catch(() => {});
+      };
+      source.connect(processor);
+      processor.connect(audioCtx.destination);
+    } catch (_) {}
+  }
+
+  function stopWebAudioCapture() {
+    active = false;
+    try {
+      if (processor) { processor.disconnect(); processor = null; }
+      if (audioCtx) { audioCtx.close(); audioCtx = null; }
+      if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+    } catch (_) {}
+  }
+
+  const es = new EventSource("/api/events");
+  es.onmessage = (ev) => {
+    try {
+      const msg = JSON.parse(ev.data);
+      if (msg.event === "recording-state" && msg.payload) {
+        if (msg.payload.recording) startWebAudioCapture();
+        else stopWebAudioCapture();
+      }
+    } catch (_) {}
+  };
+})();
+`;
+
 function createWindows() {
-  // Auto-approve microphone access in Chromium WebAudio
   session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback) => {
     if (permission === "media" || permission === "microphone" || permission === "audioCapture") {
       return callback(true);
@@ -275,16 +468,21 @@ function createWindows() {
     height: 820,
     minWidth: 960,
     minHeight: 640,
-    title: "Glaido Pro",
+    title: process.platform === "win32" ? "Glaido Pro for Windows" : "Glaido Pro for macOS",
     autoHideMenuBar: true,
     backgroundColor: "#FAF8F5",
     webPreferences: {
       contextIsolation: false,
-      nodeIntegration: false
+      nodeIntegration: false,
+      backgroundThrottling: false
     }
   });
 
   mainWindow.loadURL(`${BASE_URL}/`);
+
+  mainWindow.webContents.on("did-finish-load", () => {
+    mainWindow.webContents.executeJavaScript(WEBAUDIO_MIC_CAPTURE_SCRIPT).catch(() => {});
+  });
 
   mainWindow.on("close", (e) => {
     if (!isQuitting) {
@@ -324,128 +522,75 @@ function createWindows() {
   overlayWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
   positionOverlayWindow();
   overlayWindow.loadURL(`${BASE_URL}/overlay.html`);
-
-  // Inject native Chromium WASAPI 16kHz PCM microphone streamer into overlayWindow
-  // so Windows microphone capture works out-of-the-box with any default input device
-  overlayWindow.webContents.on("did-finish-load", () => {
-    overlayWindow.webContents
-      .executeJavaScript(`
-      (function() {
-        if (window.__glaidoWinMicInitialized) return;
-        window.__glaidoWinMicInitialized = true;
-        let audioCtx = null;
-        let mediaStream = null;
-        let processor = null;
-        let active = false;
-
-        async function startWebAudioCapture() {
-          if (active) return;
-          active = true;
-          try {
-            mediaStream = await navigator.mediaDevices.getUserMedia({
-              audio: {
-                echoCancellation: false,
-                noiseSuppression: false,
-                autoGainControl: false,
-                channelCount: 1,
-                sampleRate: 16000
-              }
-            });
-            audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
-            const source = audioCtx.createMediaStreamSource(mediaStream);
-            processor = audioCtx.createScriptProcessor(1024, 1, 1);
-            processor.onaudioprocess = (e) => {
-              if (!active) return;
-              const input = e.inputBuffer.getChannelData(0);
-              const pcm16 = new Int16Array(input.length);
-              for (let i = 0; i < input.length; i++) {
-                const s = Math.max(-1, Math.min(1, input[i]));
-                pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-              }
-              const bytes = new Uint8Array(pcm16.buffer);
-              let binary = "";
-              for (let i = 0; i < bytes.byteLength; i++) {
-                binary += String.fromCharCode(bytes[i]);
-              }
-              const pcmBase64 = btoa(binary);
-              fetch("/api/invoke", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ cmd: "push_pcm_chunk", args: { pcmBase64 } })
-              }).catch(() => {});
-            };
-            source.connect(processor);
-            processor.connect(audioCtx.destination);
-          } catch (_) {}
-        }
-
-        function stopWebAudioCapture() {
-          active = false;
-          try {
-            if (processor) { processor.disconnect(); processor = null; }
-            if (audioCtx) { audioCtx.close(); audioCtx = null; }
-            if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
-          } catch (_) {}
-        }
-
-        const es = new EventSource("/api/events");
-        es.onmessage = (ev) => {
-          try {
-            const msg = JSON.parse(ev.data);
-            if (msg.event === "recording-state" && msg.payload) {
-              if (msg.payload.recording) startWebAudioCapture();
-              else stopWebAudioCapture();
-            }
-          } catch (_) {}
-        };
-      })();
-    `)
-      .catch(() => {});
-  });
 }
 
 app.whenReady().then(async () => {
-  // Start embedded Glaido Pro Node server
-  const serverModuleUrl = pathToFileURL(path.join(__dirname, "server.mjs")).href;
-  await import(serverModuleUrl);
-  await waitForServerReady();
+  logStartup(`Starting Glaido Pro (${process.platform})...`);
+  startWindowsPasteWorker();
 
-  // Enable launch on login by default on first run
+  try {
+    const serverModuleUrl = pathToFileURL(path.join(__dirname, "server.mjs")).href;
+    await import(serverModuleUrl);
+    logStartup("server.mjs imported successfully.");
+  } catch (err) {
+    logStartup(`server.mjs import error: ${err?.stack || err}`);
+  }
+
+  const ready = await waitForServerReady();
+  logStartup(`Server ready=${ready} on ${BASE_URL}`);
+
+  if (IS_SMOKE_TEST) {
+    const settingsRes = await invokeRpc("get_settings");
+    const micsRes = await invokeRpc("get_microphone_list");
+    const envRes = await invokeRpc("get_feedback_environment");
+    console.log("SMOKE_TEST_RESULTS:", JSON.stringify({ ready, settingsRes, micsRes, envRes }));
+    isQuitting = true;
+    app.exit(ready && settingsRes && micsRes ? 0 : 1);
+    return;
+  }
+
   try {
     app.setLoginItemSettings({ openAtLogin: true });
   } catch (_) {}
 
-  tray = new Tray(createTrayIconImage(false));
-  tray.on("click", () => {
-    if (mainWindow) {
-      if (mainWindow.isVisible()) {
-        mainWindow.focus();
-      } else {
-        mainWindow.show();
-        mainWindow.focus();
+  try {
+    tray = new Tray(createTrayIconImage(false));
+    tray.on("click", () => {
+      if (mainWindow) {
+        if (mainWindow.isVisible()) {
+          mainWindow.focus();
+        } else {
+          mainWindow.show();
+          mainWindow.focus();
+        }
       }
-    }
-  });
-  updateTrayMenu();
+    });
+    updateTrayMenu();
+  } catch (err) {
+    logStartup(`Tray warning: ${err?.message || err}`);
+  }
 
   createWindows();
   subscribeToServerEvents();
 
-  // Register Windows global hotkeys for voice dictation
-  try {
-    globalShortcut.register("Alt+Space", () => {
-      toggleGlobalDictation();
-    });
-  } catch (_) {}
-  try {
-    globalShortcut.register("CommandOrControl+Shift+Space", () => {
-      toggleGlobalDictation();
-    });
-  } catch (_) {}
+  // Register global hotkeys
+  const hotkeysToRegister = ["Alt+Space", "CommandOrControl+Shift+Space"];
+  for (const hk of hotkeysToRegister) {
+    try {
+      globalShortcut.register(hk, () => {
+        toggleGlobalDictation();
+      });
+    } catch (_) {}
+  }
 });
 
 app.on("will-quit", () => {
   globalShortcut.unregisterAll();
+  if (winPasteWorker) {
+    try {
+      winPasteWorker.kill();
+    } catch (_) {}
+  }
 });
 
 app.on("window-all-closed", (e) => {

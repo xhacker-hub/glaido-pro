@@ -5,21 +5,107 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
-import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 
 const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const IS_WINDOWS = process.platform === "win32" || process.env.GLAIDO_TARGET_OS === "windows";
 const PUBLIC_DIR = path.join(__dirname, "public");
 const WRITABLE_DIR = process.env.GLAIDO_DATA_DIR || __dirname;
 fs.mkdirSync(WRITABLE_DIR, { recursive: true });
 const AUDIO_DIR = process.env.GLAIDO_DATA_DIR
   ? path.join(WRITABLE_DIR, "audio")
   : path.join(PUBLIC_DIR, "audio");
-const DB_PATH = path.join(WRITABLE_DIR, "glaido-open.db");
+const DB_PATH = path.join(WRITABLE_DIR, IS_WINDOWS ? "glaido-windows.db" : "glaido-open.db");
 const PORT = Number(process.env.PORT || 4321);
 
 fs.mkdirSync(AUDIO_DIR, { recursive: true });
+
+async function openGlaidoDatabase(dbPath) {
+  try {
+    const sqliteMod = await import("node:sqlite");
+    if (sqliteMod && sqliteMod.DatabaseSync) {
+      return new sqliteMod.DatabaseSync(dbPath);
+    }
+  } catch (_) {}
+
+  // Fallback for Electron on Windows where node:sqlite is not compiled into electron.exe:
+  // Use sql.js (real SQLite3 compiled to WebAssembly) with synchronous DatabaseSync-compatible API
+  const initSqlJs = (await import("sql.js")).default;
+  const wasmCandidate = path.join(__dirname, "node_modules", "sql.js", "dist", "sql-wasm.wasm");
+  const SQL = await initSqlJs({
+    locateFile: (file) =>
+      fs.existsSync(wasmCandidate) ? wasmCandidate : path.join(__dirname, "node_modules", "sql.js", "dist", file)
+  });
+
+  let rawDb = null;
+  if (fs.existsSync(dbPath)) {
+    try {
+      const existingBuf = fs.readFileSync(dbPath);
+      if (existingBuf && existingBuf.length > 0) {
+        rawDb = new SQL.Database(existingBuf);
+      }
+    } catch (_) {
+      rawDb = null;
+    }
+  }
+  if (!rawDb) {
+    rawDb = new SQL.Database();
+  }
+
+  const persistToDisk = () => {
+    try {
+      const exported = rawDb.export();
+      fs.writeFileSync(dbPath, Buffer.from(exported));
+    } catch (_) {}
+  };
+
+  return {
+    exec(sql) {
+      rawDb.run(sql);
+      persistToDisk();
+    },
+    prepare(sql) {
+      return {
+        run(...params) {
+          const bound = params.map((p) => (p === undefined ? null : p));
+          rawDb.run(sql, bound);
+          persistToDisk();
+          return { changes: rawDb.getRowsModified() };
+        },
+        get(...params) {
+          const stmt = rawDb.prepare(sql);
+          try {
+            if (params.length > 0) {
+              stmt.bind(params.map((p) => (p === undefined ? null : p)));
+            }
+            if (stmt.step()) {
+              return stmt.getAsObject();
+            }
+            return undefined;
+          } finally {
+            stmt.free();
+          }
+        },
+        all(...params) {
+          const stmt = rawDb.prepare(sql);
+          const rows = [];
+          try {
+            if (params.length > 0) {
+              stmt.bind(params.map((p) => (p === undefined ? null : p)));
+            }
+            while (stmt.step()) {
+              rows.push(stmt.getAsObject());
+            }
+            return rows;
+          } finally {
+            stmt.free();
+          }
+        }
+      };
+    }
+  };
+}
 
 // ============================================================================
 // 1. Playable WAV Generator (16kHz, 16-bit mono PCM)
@@ -67,9 +153,8 @@ function ensureAudioFile(filename, durationSec = 2.8, freq = 210) {
 // ============================================================================
 // 2. Exact 11-Table Glaido SQLite Schema + Seed Data
 // ============================================================================
-const db = new DatabaseSync(DB_PATH);
+const db = await openGlaidoDatabase(DB_PATH);
 db.exec(`
-  PRAGMA journal_mode = WAL;
   PRAGMA foreign_keys = ON;
 
   CREATE TABLE IF NOT EXISTS sessions (
@@ -197,7 +282,7 @@ db.exec(`
 const defaultSettings = {
   microphone_mode: "auto",
   preferred_microphone_reference: null,
-  preferred_microphone_name: "MacBook Pro Microphone",
+  preferred_microphone_name: IS_WINDOWS ? "Windows Default Microphone (WASAPI)" : "MacBook Pro Microphone",
   auto_detect_include_bluetooth: true,
   show_virtual_microphones: false,
   selected_languages: ["en"],
@@ -1361,6 +1446,10 @@ if (process.platform === "darwin") {
 async function copyAndPasteText(text, shouldPaste = false) {
   if (!text) return;
   try {
+    if (typeof globalThis.__glaidoElectronPaste === "function") {
+      await globalThis.__glaidoElectronPaste(text, shouldPaste);
+      return;
+    }
     if (process.platform === "win32") {
       await new Promise((resolve) => {
         const proc = execFile("clip", () => resolve());
@@ -2083,16 +2172,48 @@ async function handleInvoke(cmd, args = {}) {
       return { microphone: true, accessibility: true };
 
     case "get_microphone_list":
+      if (IS_WINDOWS) {
+        const winMics = [
+          {
+            name: windowsDshowMicName || "Windows Default Microphone (WASAPI)",
+            reference: "win-default-wasapi",
+            is_default: true,
+            is_bluetooth: false,
+            is_virtual: false
+          }
+        ];
+        if (windowsDshowMicName && windowsDshowMicName !== "Windows Default Microphone (WASAPI)") {
+          winMics.push({
+            name: "Windows Default Microphone (WASAPI)",
+            reference: "win-system-default",
+            is_default: false,
+            is_bluetooth: false,
+            is_virtual: false
+          });
+        }
+        return winMics;
+      }
       return [
         { name: "MacBook Pro Microphone", reference: "built-in-mic", is_default: true, is_bluetooth: false, is_virtual: false },
         { name: "AirPods Pro", reference: "bt-airpods-pro", is_default: false, is_bluetooth: true, is_virtual: false }
       ];
 
     case "get_auto_detect_microphone_name":
-      return "MacBook Pro Microphone";
+      return IS_WINDOWS ? windowsDshowMicName || "Windows Default Microphone (WASAPI)" : "MacBook Pro Microphone";
 
     case "get_binding_display": {
       const b = args.binding;
+      if (IS_WINDOWS) {
+        if (!b) return ["Space", ["Alt"]];
+        if (b.custom_primary) {
+          return [b.custom_primary, Array.isArray(b.custom_modifiers) ? b.custom_modifiers : []];
+        }
+        if (b.primary_keycode === 61) return ["Space", ["Ctrl", "Shift"]];
+        if (b.primary_keycode === 58) return ["Left Alt", []];
+        if (b.primary_keycode === 63) return ["Space", ["Alt"]];
+        if (b.primary_keycode === 49) return ["Space", ["Ctrl"]];
+        return ["Space", ["Alt"]];
+      }
       if (!b) return ["Right Option", []];
       if (b.custom_primary) {
         return [b.custom_primary, Array.isArray(b.custom_modifiers) ? b.custom_modifiers : []];
@@ -2346,6 +2467,18 @@ async function handleInvoke(cmd, args = {}) {
       return null;
 
     case "get_installed_app_options":
+      if (IS_WINDOWS) {
+        return [
+          { identity: { platform: "windows", kind: "exe_name", value: "Antigravity.exe" }, name: "Antigravity IDE" },
+          { identity: { platform: "windows", kind: "exe_name", value: "Code.exe" }, name: "Visual Studio Code" },
+          { identity: { platform: "windows", kind: "exe_name", value: "Cursor.exe" }, name: "Cursor" },
+          { identity: { platform: "windows", kind: "exe_name", value: "chrome.exe" }, name: "Google Chrome" },
+          { identity: { platform: "windows", kind: "exe_name", value: "msedge.exe" }, name: "Microsoft Edge" },
+          { identity: { platform: "windows", kind: "exe_name", value: "Claude.exe" }, name: "Claude" },
+          { identity: { platform: "windows", kind: "exe_name", value: "Discord.exe" }, name: "Discord" },
+          { identity: { platform: "windows", kind: "exe_name", value: "WindowsTerminal.exe" }, name: "Windows Terminal" }
+        ];
+      }
       return [
         { identity: { platform: "macos", kind: "bundle_id", value: "com.google.antigravity-ide" }, name: "Antigravity IDE" },
         { identity: { platform: "macos", kind: "bundle_id", value: "com.anthropic.claudefordesktop" }, name: "Claude" },
@@ -2357,6 +2490,37 @@ async function handleInvoke(cmd, args = {}) {
       ];
 
     case "get_formatting_place_options":
+      if (IS_WINDOWS) {
+        return {
+          apps: [
+            {
+              identity: { platform: "windows", kind: "exe_name", value: "Antigravity.exe" },
+              name: "Antigravity IDE",
+              uses: 28,
+              last_used_at: new Date().toISOString()
+            },
+            {
+              identity: { platform: "windows", kind: "exe_name", value: "Code.exe" },
+              name: "Visual Studio Code",
+              uses: 19,
+              last_used_at: new Date().toISOString()
+            },
+            {
+              identity: { platform: "windows", kind: "exe_name", value: "chrome.exe" },
+              name: "Google Chrome",
+              uses: 14,
+              last_used_at: new Date().toISOString()
+            }
+          ],
+          sites: [
+            { host: "mail.google.com", uses: 22 },
+            { host: "github.com", uses: 18 },
+            { host: "linear.app", uses: 11 },
+            { host: "app.slack.com", uses: 9 },
+            { host: "notion.so", uses: 7 }
+          ]
+        };
+      }
       return {
         apps: [
           {
@@ -2398,14 +2562,18 @@ async function handleInvoke(cmd, args = {}) {
       return getBuiltinInventory();
 
     case "get_mcp_config_path":
-      return path.join(__dirname, "mcp.json");
+      return path.join(WRITABLE_DIR, "mcp.json");
 
     case "glaido_servers_root":
     case "pick_glaido_servers_root":
-      return path.join(__dirname, "mcp-servers");
+      return path.join(WRITABLE_DIR, "mcp-servers");
 
     case "probe_server_runtime":
-      return { available: true, path: "/opt/homebrew/bin/node", version: "24.21.0" };
+      return {
+        available: true,
+        path: process.execPath || (IS_WINDOWS ? "C:\\Program Files\\nodejs\\node.exe" : "/opt/homebrew/bin/node"),
+        version: process.versions?.node || "22.14.0"
+      };
 
     case "save_mcp_server": {
       const s = args.server || {};
@@ -2535,6 +2703,18 @@ async function handleInvoke(cmd, args = {}) {
       return computeAnalyticsDaily();
 
     case "get_device_analytics":
+      if (IS_WINDOWS) {
+        return {
+          apps: [
+            { app_name: "Antigravity IDE", sessions: 34 },
+            { app_name: "Visual Studio Code", sessions: 22 },
+            { app_name: "Google Chrome", sessions: 16 },
+            { app_name: "Cursor", sessions: 12 },
+            { app_name: "Discord", sessions: 9 },
+            { app_name: "File Explorer", sessions: 6 }
+          ]
+        };
+      }
       return {
         apps: [
           { app_name: "Antigravity IDE", sessions: 34 },
@@ -2565,7 +2745,9 @@ async function handleInvoke(cmd, args = {}) {
       return { ok: true };
 
     case "get_feedback_environment":
-      return { os: "macOS 15.4 (arm64)", app_version: "0.4.3-open-pro" };
+      return IS_WINDOWS
+        ? { os: "Windows 11 Pro (x64)", app_version: "0.4.3-windows-pro" }
+        : { os: "macOS 15.4 (arm64)", app_version: "0.4.3-macos-pro" };
 
     case "submit_feedback":
       return { ok: true };
