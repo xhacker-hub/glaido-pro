@@ -1,6 +1,78 @@
 import Cocoa
 import Carbon
 import WebKit
+import CoreAudio
+
+private func ensureBuiltInMacMicrophoneSelected() {
+    var address = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDevices,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var size: UInt32 = 0
+    guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size) == noErr, size > 0 else {
+        return
+    }
+    let count = Int(size) / MemoryLayout<AudioDeviceID>.size
+    var devices = [AudioDeviceID](repeating: 0, count: count)
+    guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &devices) == noErr else {
+        return
+    }
+
+    var builtInMicID: AudioDeviceID?
+    for dev in devices {
+        var streamAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreamConfiguration,
+            mScope: kAudioObjectPropertyScopeInput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var streamSize: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(dev, &streamAddr, 0, nil, &streamSize) == noErr, streamSize > 0 else { continue }
+        let rawPtr = UnsafeMutableRawPointer.allocate(byteCount: Int(streamSize), alignment: MemoryLayout<AudioBufferList>.alignment)
+        defer { rawPtr.deallocate() }
+        guard AudioObjectGetPropertyData(dev, &streamAddr, 0, nil, &streamSize, rawPtr) == noErr else { continue }
+        let bufList = UnsafeMutableAudioBufferListPointer(rawPtr.assumingMemoryBound(to: AudioBufferList.self))
+        let inChans = bufList.reduce(0) { $0 + Int($1.mNumberChannels) }
+        if inChans <= 0 { continue }
+
+        var transAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyTransportType,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var transport: UInt32 = 0
+        var transSize = UInt32(MemoryLayout<UInt32>.size)
+        if AudioObjectGetPropertyData(dev, &transAddr, 0, nil, &transSize, &transport) == noErr {
+            if transport == kAudioDeviceTransportTypeBuiltIn {
+                builtInMicID = dev
+                break
+            }
+        }
+    }
+
+    guard let safeMic = builtInMicID else { return }
+
+    var defAddr = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultInputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var currentDefault: AudioDeviceID = 0
+    var defSize = UInt32(MemoryLayout<AudioDeviceID>.size)
+    if AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &defAddr, 0, nil, &defSize, &currentDefault) == noErr {
+        if currentDefault != safeMic {
+            var newDef = safeMic
+            AudioObjectSetPropertyData(
+                AudioObjectID(kAudioObjectSystemObject),
+                &defAddr,
+                0,
+                nil,
+                UInt32(MemoryLayout<AudioDeviceID>.size),
+                &newDef
+            )
+        }
+    }
+}
 
 // Global C callback for Carbon RegisterEventHotKey (works in ALL macOS apps with zero Input Monitoring permission)
 private var sharedAgent: GlaidoMacAgent?
@@ -33,6 +105,7 @@ final class GlaidoMacAgent: NSObject, NSApplicationDelegate, NSWindowDelegate, W
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         sharedAgent = self
+        ensureBuiltInMacMicrophoneSelected()
         ensureBackendServerRunning()
         setupMenuBar()
         setupMainWindow()
@@ -328,6 +401,7 @@ final class GlaidoMacAgent: NSObject, NSApplicationDelegate, NSWindowDelegate, W
 
     func toggleDictationFromGlobalHotkey() {
         if !isRecording {
+            ensureBuiltInMacMicrophoneSelected()
             if let front = NSWorkspace.shared.frontmostApplication,
                front.bundleIdentifier != Bundle.main.bundleIdentifier {
                 targetApp = front

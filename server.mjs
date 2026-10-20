@@ -1433,6 +1433,22 @@ let webAudioPcmByteLength = 0;
 let lastWebAmpBroadcastAt = 0;
 let lastRecordedPcmBuffer = null;
 let windowsDshowMicName = null;
+let macosBuiltInMicName = "MacBook Pro Microphone";
+
+function isForbiddenContinuityMicName(name) {
+  return /iphone|ipad|continuity|desk\s*view/i.test(String(name || ""));
+}
+
+function resolveMacosMicName() {
+  try {
+    const cur = getStoredJson("app_settings", defaultSettings);
+    const pref = String(cur?.preferred_microphone_name || "").trim();
+    if (pref && !isForbiddenContinuityMicName(pref) && !/windows|wasapi/i.test(pref)) {
+      return pref;
+    }
+  } catch (_) {}
+  return macosBuiltInMicName || "MacBook Pro Microphone";
+}
 
 function resolveFfmpegBin() {
   if (process.env.FFMPEG_BIN && fs.existsSync(process.env.FFMPEG_BIN)) {
@@ -1447,12 +1463,38 @@ function resolveFfmpegBin() {
   return "ffmpeg";
 }
 
-// Pre-compile AppleScript paste helper on macOS, or detect DirectShow mic on Windows
+// Pre-compile AppleScript paste helper & detect built-in Mac mic on macOS (blocking iPhone Continuity Mic),
+// or detect DirectShow mic on Windows
 if (process.platform === "darwin") {
   execFile(
     "/usr/bin/osacompile",
     ["-e", 'tell application "System Events" to keystroke "v" using command down', "-o", PASTE_SCPT],
     () => {}
+  );
+  execFile(
+    "/usr/sbin/system_profiler",
+    ["SPAudioDataType", "-json"],
+    { timeout: 3000 },
+    (_err, stdout) => {
+      try {
+        const parsed = JSON.parse(stdout || "{}");
+        const items = parsed?.SPAudioDataType?.[0]?._items || [];
+        const safeInputs = items.filter(
+          (item) =>
+            Number(item?.coreaudio_device_input || 0) >= 1 &&
+            !isForbiddenContinuityMicName(item?._name) &&
+            item?.coreaudio_device_transport !== "coreaudio_device_type_unknown"
+        );
+        const builtIn = safeInputs.find(
+          (item) => item?.coreaudio_device_transport === "coreaudio_device_type_builtin"
+        );
+        if (builtIn && builtIn._name) {
+          macosBuiltInMicName = builtIn._name;
+        } else if (safeInputs[0] && safeInputs[0]._name) {
+          macosBuiltInMicName = safeInputs[0]._name;
+        }
+      } catch (_) {}
+    }
   );
 } else if (process.platform === "win32") {
   execFile(
@@ -1941,7 +1983,7 @@ function startNativeMicRecording() {
     const inputArgs =
       process.platform === "win32"
         ? ["-f", "dshow", "-audio_buffer_size", "20", "-i", `audio=${windowsDshowMicName || "Microphone"}`]
-        : ["-f", "avfoundation", "-i", ":0"];
+        : ["-f", "avfoundation", "-i", `:${resolveMacosMicName()}`];
 
     activeFfmpegProc = spawn(
       resolveFfmpegBin(),
@@ -2239,12 +2281,11 @@ async function handleInvoke(cmd, args = {}) {
         return winMics;
       }
       return [
-        { name: "MacBook Pro Microphone", reference: "built-in-mic", is_default: true, is_bluetooth: false, is_virtual: false },
-        { name: "AirPods Pro", reference: "bt-airpods-pro", is_default: false, is_bluetooth: true, is_virtual: false }
+        { name: resolveMacosMicName(), reference: "built-in-mic", is_default: true, is_bluetooth: false, is_virtual: false }
       ];
 
     case "get_auto_detect_microphone_name":
-      return IS_WINDOWS ? windowsDshowMicName || "Windows Default Microphone (WASAPI)" : "MacBook Pro Microphone";
+      return IS_WINDOWS ? windowsDshowMicName || "Windows Default Microphone (WASAPI)" : resolveMacosMicName();
 
     case "get_binding_display": {
       const b = args.binding;
@@ -3128,6 +3169,9 @@ const server = http.createServer(async (req, res) => {
 const listenPort = Number(process.env.PORT || PORT || 4321);
 server.on("error", (err) => {
   console.error("[SERVER_ERROR]", err?.message || err);
+  if (!process.versions.electron && err && err.code === "EADDRINUSE") {
+    process.exit(1);
+  }
 });
 if (IS_WINDOWS) {
   server.listen(listenPort, "127.0.0.1", () => {

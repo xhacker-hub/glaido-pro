@@ -551,7 +551,9 @@ function createWindows() {
   mainWindow.loadURL(`${BASE_URL}/`);
 
   mainWindow.webContents.on("did-finish-load", () => {
-    mainWindow.webContents.executeJavaScript(WEBAUDIO_MIC_CAPTURE_SCRIPT).catch(() => {});
+    if (process.platform === "win32") {
+      mainWindow.webContents.executeJavaScript(WEBAUDIO_MIC_CAPTURE_SCRIPT).catch(() => {});
+    }
   });
 
   mainWindow.webContents.on("did-fail-load", (_event, errorCode, errorDescription, validatedURL) => {
